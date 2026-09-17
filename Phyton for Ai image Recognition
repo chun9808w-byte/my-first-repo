@@ -1,197 +1,797 @@
 import os
-import sys 
-
-# 1. INJECT DLLS FIRST
-cuda_bin = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\x64"
-cudnn_bin = r"C:\Program Files\NVIDIA\CUDNN\v9.26\bin\13.4\x64"
-
-if os.path.exists(cuda_bin): 
-    os.add_dll_directory(cuda_bin)
-if os.path.exists(cudnn_bin):
-    os.add_dll_directory(cudnn_bin)
-
-# 2. NOW IMPORT EVERYTHING ELSE
 import cv2
 import sqlite3
 import numpy as np
 import queue
 import threading
 import time
+from collections import deque, Counter
 from insightface.app import FaceAnalysis
 
-# ---------------------------------------------------------
-# 1. Load SQLite Embeddings
-# ---------------------------------------------------------
-print("Loading identity database from SQLite...")
-conn = sqlite3.connect("students.db")
-cursor = conn.cursor()
-cursor.execute("SELECT name, embedding FROM faces")
-rows = cursor.fetchall()
-conn.close()
 
-known_names = []
-known_embeddings = []
+# =========================================================
+# 0. CUDA / cuDNN DLL SETUP
+# =========================================================
 
-for name, embedding_blob in rows:
-    emb = np.frombuffer(embedding_blob, dtype=np.float32)
-    known_names.append(name)
-    known_embeddings.append(emb)
+CUDA_BIN = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\x64"
+CUDNN_BIN = r"C:\Program Files\NVIDIA\CUDNN\v9.26\bin\13.4\x64"
 
-if known_embeddings:
-    known_embeddings = np.array(known_embeddings)
-    print(f"Loaded {len(known_names)} identities: {known_names}")
-else:
-    print("⚠️ Warning: No faces in SQLite database.")
+if os.path.exists(CUDA_BIN):
+    os.add_dll_directory(CUDA_BIN)
 
-# ---------------------------------------------------------
-# 2. Shared Queues & AI Model Initialization
-# ---------------------------------------------------------
+if os.path.exists(CUDNN_BIN):
+    os.add_dll_directory(CUDNN_BIN)
+
+
+# =========================================================
+# 1. CONFIGURATION
+# =========================================================
+
+CAMERA_SOURCE = "http://192.168.100.12:8080/video"
+
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+
+# AI processing rate
+AI_FPS = 6.0
+
+# Face detection / recognition
+DETECTION_THRESHOLD = 0.40
+SIMILARITY_THRESHOLD = 0.45
+
+# Face quality
+MIN_FACE_SIZE = 32
+BLUR_THRESHOLD = 25.0
+
+# Temporal confirmation
+HISTORY_LENGTH = 7
+MIN_CONFIRMATIONS = 4
+
+# Motion detection
+ENABLE_MOTION_GATE = True
+MOTION_RESOLUTION = (320, 180)
+MOTION_PIXEL_THRESHOLD = 20
+MOTION_MIN_AREA = 500
+MOTION_HOLD_SECONDS = 2.0
+
+# Display
+SHOW_SIMILARITY = True
+
+
+# =========================================================
+# 2. GLOBAL STATE
+# =========================================================
+
+# We only care about the newest camera frame.
 input_queue = queue.Queue(maxsize=1)
-output_queue = queue.Queue(maxsize=1)
 
-print("Initializing AI Engine on GPU...")
-app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
-# SPEED UPGRADE: Reduced det_size to 320x320. 
-# This makes the AI process frames significantly faster while keeping the GPU load manageable.
-app.prepare(ctx_id=0, det_size=(320, 320))
+latest_detections = []
+detections_lock = threading.Lock()
 
-from collections import deque, Counter
-import numpy as np
+stop_event = threading.Event()
 
-# ---------------------------------------------------------
-# 3. AI Worker Thread (Background Processing + Multi-Frame Voting)
-# ---------------------------------------------------------
-latest_detections = [] 
+
+# =========================================================
+# 3. LOAD STUDENT EMBEDDINGS
+# =========================================================
+
+def load_student_embeddings(db_path="students.db"):
+    print("[INFO] Loading identity database...")
+
+    known_names = []
+    known_embeddings = []
+
+    if not os.path.exists(db_path):
+        print("[WARNING] Database not found.")
+        return known_names, np.empty((0, 512), dtype=np.float32)
+
+    conn = sqlite3.connect(db_path)
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, embedding FROM faces")
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    for name, embedding_blob in rows:
+        try:
+            embedding = np.frombuffer(
+                embedding_blob,
+                dtype=np.float32
+            ).copy()
+
+            if embedding.size != 512:
+                print(
+                    f"[WARNING] Skipping {name}: "
+                    f"expected 512 values, got {embedding.size}"
+                )
+                continue
+
+            norm = np.linalg.norm(embedding)
+
+            if norm == 0:
+                continue
+
+            # Normalize once when the database is loaded.
+            embedding /= norm
+
+            known_names.append(name)
+            known_embeddings.append(embedding)
+
+        except Exception as e:
+            print(f"[WARNING] Failed loading {name}: {e}")
+
+    if not known_embeddings:
+        print("[WARNING] No valid embeddings found.")
+        return known_names, np.empty((0, 512), dtype=np.float32)
+
+    known_embeddings = np.asarray(
+        known_embeddings,
+        dtype=np.float32
+    )
+
+    print(f"[INFO] Loaded {len(known_names)} face embeddings.")
+    print(f"[INFO] Identities: {sorted(set(known_names))}")
+
+    return known_names, known_embeddings
+
+
+known_names, known_embeddings = load_student_embeddings()
+
+
+# =========================================================
+# 4. INITIALIZE INSIGHTFACE
+# =========================================================
+
+print("[INFO] Initializing AI Engine...")
+
+app = FaceAnalysis(
+    name="buffalo_l",
+    providers=[
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider"
+    ]
+)
+
+app.prepare(
+    ctx_id=0,
+    det_thresh=DETECTION_THRESHOLD,
+    det_size=(640, 640)
+)
+
+# Higher NMS threshold keeps more strongly-overlapping face boxes,
+# which can help when people are packed closely together.
+app.det_model.nms_thresh = 0.50
+
+print("[INFO] AI engine ready.")
+print(f"[INFO] Detection size: {app.det_model.input_size}")
+print(f"[INFO] Detection threshold: {DETECTION_THRESHOLD}")
+print(f"[INFO] NMS threshold: {app.det_model.nms_thresh}")
+
+
+# =========================================================
+# 5. MOTION DETECTOR
+# =========================================================
+
+class MotionDetector:
+
+    def __init__(self):
+        self.previous_gray = None
+        self.last_motion_time = 0.0
+
+    def detect(self, frame):
+        small = cv2.resize(
+            frame,
+            MOTION_RESOLUTION
+        )
+
+        gray = cv2.cvtColor(
+            small,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        gray = cv2.GaussianBlur(
+            gray,
+            (5, 5),
+            0
+        )
+
+        if self.previous_gray is None:
+            self.previous_gray = gray
+            return False
+
+        difference = cv2.absdiff(
+            self.previous_gray,
+            gray
+        )
+
+        _, threshold = cv2.threshold(
+            difference,
+            MOTION_PIXEL_THRESHOLD,
+            255,
+            cv2.THRESH_BINARY
+        )
+
+        threshold = cv2.dilate(
+            threshold,
+            None,
+            iterations=2
+        )
+
+        contours, _ = cv2.findContours(
+            threshold,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        motion_found = any(
+            cv2.contourArea(contour) >= MOTION_MIN_AREA
+            for contour in contours
+        )
+
+        self.previous_gray = gray
+
+        if motion_found:
+            self.last_motion_time = time.time()
+
+        return (
+            time.time() - self.last_motion_time
+            < MOTION_HOLD_SECONDS
+        )
+
+
+# =========================================================
+# 6. FACE QUALITY
+# =========================================================
+
+def face_is_good_quality(face, frame):
+    """
+    Reject faces that are too small or too blurry.
+    Thresholds are intentionally fairly permissive for crowded scenes.
+    """
+
+    bbox = face.bbox.astype(int)
+
+    x1 = max(0, bbox[0])
+    y1 = max(0, bbox[1])
+    x2 = min(frame.shape[1], bbox[2])
+    y2 = min(frame.shape[0], bbox[3])
+
+    width = x2 - x1
+    height = y2 - y1
+
+    if width < MIN_FACE_SIZE or height < MIN_FACE_SIZE:
+        return False
+
+    crop = frame[y1:y2, x1:x2]
+
+    if crop.size == 0:
+        return False
+
+    gray = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    blur_score = cv2.Laplacian(
+        gray,
+        cv2.CV_64F
+    ).var()
+
+    return blur_score >= BLUR_THRESHOLD
+
+
+# =========================================================
+# 7. FACE MATCHING
+# =========================================================
+
+def recognize_face(embedding):
+    if len(known_embeddings) == 0:
+        return "Unknown", 0.0
+
+    embedding = embedding.astype(
+        np.float32,
+        copy=False
+    )
+
+    norm = np.linalg.norm(embedding)
+
+    if norm == 0:
+        return "Unknown", 0.0
+
+    embedding = embedding / norm
+
+    # Database vectors are already normalized, so dot product
+    # is cosine similarity.
+    similarities = np.dot(
+        known_embeddings,
+        embedding
+    )
+
+    best_index = int(np.argmax(similarities))
+    best_similarity = float(similarities[best_index])
+
+    if best_similarity >= SIMILARITY_THRESHOLD:
+        return known_names[best_index], best_similarity
+
+    return "Unknown", best_similarity
+
+
+# =========================================================
+# 8. SIMPLE TRACKING
+# =========================================================
+
+def calculate_center(bbox):
+    x1, y1, x2, y2 = bbox
+
+    return (
+        (x1 + x2) // 2,
+        (y1 + y2) // 2
+    )
+
+
+def assign_track_id(
+    center,
+    previous_targets,
+    next_track_id,
+    max_distance=150
+):
+    cx, cy = center
+
+    best_id = None
+    best_distance = float("inf")
+    best_index = -1
+
+    for i, (px, py, track_id) in enumerate(previous_targets):
+        distance = np.hypot(
+            cx - px,
+            cy - py
+        )
+
+        if (
+            distance < best_distance
+            and distance < max_distance
+        ):
+            best_distance = distance
+            best_id = track_id
+            best_index = i
+
+    if best_id is not None:
+        remaining = [
+            target
+            for i, target in enumerate(previous_targets)
+            if i != best_index
+        ]
+
+        return best_id, remaining
+
+    return next_track_id, previous_targets
+
+
+# =========================================================
+# 9. AI WORKER
+# =========================================================
 
 def ai_worker():
     global latest_detections
-    SIMILARITY_THRESHOLD = 0.45
-    
+
     track_history = {}
+    previous_targets = []
+
     next_track_id = 0
-    previous_targets = []  
+    last_ai_time = 0.0
 
-    while True:
-        frame = input_queue.get()
-        if frame is None:
-            break
+    while not stop_event.is_set():
 
-        faces = app.get(frame)
-        current_frame_detections = []
-        current_targets = []
+        try:
+            frame = input_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
 
-        # 🔥 FIX: Create a pool of available IDs for this specific frame
-        available_prev_targets = previous_targets.copy()
+        now = time.time()
 
-        for face in faces:
-            bbox = face.bbox.astype(int)
-            embedding = face.embedding
+        # We use the queue only as a "latest frame" buffer and never call
+        # queue.join(), so task_done() is intentionally not needed.
+        if now - last_ai_time < 1.0 / AI_FPS:
+            continue
 
-            raw_identity = "Intruder"
-            max_sim = 0.0
+        last_ai_time = now
 
-            if len(known_embeddings) > 0:
-                dot_product = np.dot(known_embeddings, embedding)
-                norms = np.linalg.norm(known_embeddings, axis=1) * np.linalg.norm(embedding)
-                similarities = dot_product / norms
+        try:
+            # ==========================================
+            # FACE DETECTION
+            # ==========================================
 
-                best_match_idx = np.argmax(similarities)
-                max_sim = similarities[best_match_idx]
+            faces = app.get(
+                frame,
+                max_num=0
+            )
 
-                if max_sim >= SIMILARITY_THRESHOLD:
-                    raw_identity = known_names[best_match_idx]
+            current_targets = []
+            current_detections = []
 
-            # 🔥 FIX: Exclusive Distance Matching for Crowds
-            center_x = (bbox[0] + bbox[2]) // 2
-            center_y = (bbox[1] + bbox[3]) // 2
-            
-            assigned_id = None
-            best_match_index = -1
-            min_dist = 150  # Maximum pixels a face can move between frames
-            
-            # Find the absolute closest previous face
-            for i, (prev_x, prev_y, tid) in enumerate(available_prev_targets):
-                dist = np.hypot(center_x - prev_x, center_y - prev_y)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_match_index = i
-                    assigned_id = tid
-            
-            if assigned_id is not None:
-                # Remove it from the pool so another person nearby can't steal it
-                available_prev_targets.pop(best_match_index)
-            else:
-                # If no previous face is close enough, they are a new arrival
-                assigned_id = next_track_id
-                next_track_id += 1
+            available_previous = previous_targets.copy()
 
-            current_targets.append((center_x, center_y, assigned_id))
+            for face in faces:
 
-            if assigned_id not in track_history:
-                track_history[assigned_id] = deque(maxlen=7)
-            
-            track_history[assigned_id].append(raw_identity)
+                # SCRFD already used DETECTION_THRESHOLD in app.prepare().
+                # Keep this second check consistent with the same threshold.
+                if hasattr(face, "det_score"):
+                    if float(face.det_score) < DETECTION_THRESHOLD:
+                        continue
 
-            vote_counts = Counter(track_history[assigned_id])
-            voted_identity = vote_counts.most_common(1)[0][0]
+                if not face_is_good_quality(face, frame):
+                    continue
 
-            current_frame_detections.append((bbox, voted_identity, max_sim))
+                bbox = face.bbox.astype(int)
 
-        previous_targets = current_targets
+                # ==========================================
+                # FACE EMBEDDING
+                # ==========================================
 
-        if len(track_history) > 20:
-            active_ids = {t[2] for t in current_targets}
-            track_history = {k: v for k, v in track_history.items() if k in active_ids}
+                embedding = face.normed_embedding
 
-        latest_detections = current_frame_detections
-        input_queue.task_done()# ---------------------------------------------------------
-# 4. Main Thread: Camera & Display Window
-# ---------------------------------------------------------
+                if embedding is None:
+                    continue
+
+                # ==========================================
+                # RECOGNITION
+                # ==========================================
+
+                raw_identity, similarity = recognize_face(
+                    embedding
+                )
+
+                # ==========================================
+                # TRACKING
+                # ==========================================
+
+                center = calculate_center(bbox)
+
+                track_id, available_previous = assign_track_id(
+                    center,
+                    available_previous,
+                    next_track_id
+                )
+
+                if track_id == next_track_id:
+                    next_track_id += 1
+
+                current_targets.append(
+                    (
+                        center[0],
+                        center[1],
+                        track_id
+                    )
+                )
+
+                # ==========================================
+                # TEMPORAL CONFIRMATION
+                # ==========================================
+
+                if track_id not in track_history:
+                    track_history[track_id] = deque(
+                        maxlen=HISTORY_LENGTH
+                    )
+
+                track_history[track_id].append(
+                    raw_identity
+                )
+
+                vote_counts = Counter(
+                    track_history[track_id]
+                )
+
+                candidate_identity, candidate_count = (
+                    vote_counts.most_common(1)[0]
+                )
+
+                # Unknown can be displayed immediately.
+                # A known student must appear enough times before
+                # their name is confirmed.
+                if candidate_identity == "Unknown":
+                    display_identity = "Unknown"
+                elif candidate_count >= MIN_CONFIRMATIONS:
+                    display_identity = candidate_identity
+                else:
+                    display_identity = "Identifying..."
+
+                # ==========================================
+                # STORE RESULT
+                # ==========================================
+
+                current_detections.append(
+                    {
+                        "bbox": bbox,
+                        "identity": display_identity,
+                        "raw_identity": raw_identity,
+                        "similarity": similarity,
+                        "track_id": track_id,
+                        "confirmations": candidate_count,
+                        "timestamp": now
+                    }
+                )
+
+            previous_targets = current_targets
+
+            # Keep history only for tracks visible in the current AI frame.
+            active_ids = {
+                item[2]
+                for item in current_targets
+            }
+
+            track_history = {
+                track_id: history
+                for track_id, history in track_history.items()
+                if track_id in active_ids
+            }
+
+            with detections_lock:
+                latest_detections = current_detections
+
+        except Exception as e:
+            print(
+                f"[AI ERROR] {type(e).__name__}: {e}"
+            )
+
+
+# =========================================================
+# 10. SEND ONLY LATEST FRAME
+# =========================================================
+
+def send_latest_frame(frame):
+    """
+    Keep only the newest frame so the AI does not build up latency.
+    """
+
+    if input_queue.full():
+        try:
+            input_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    try:
+        input_queue.put_nowait(
+            frame.copy()
+        )
+    except queue.Full:
+        pass
+
+
+# =========================================================
+# 11. DRAW RESULTS
+# =========================================================
+
+def draw_detections(
+    frame,
+    detections
+):
+    current_time = time.time()
+
+    for detection in detections:
+
+        # Do not draw old AI coordinates over a newer live frame.
+        age = current_time - detection["timestamp"]
+
+        if age > 0.5:
+            continue
+
+        bbox = detection["bbox"]
+        identity = detection["identity"]
+        similarity = detection["similarity"]
+
+        x1, y1, x2, y2 = bbox
+
+        if identity == "Unknown":
+            color = (0, 0, 255)
+        elif identity == "Identifying...":
+            color = (0, 255, 255)
+        else:
+            color = (0, 255, 0)
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            color,
+            2
+        )
+
+        if SHOW_SIMILARITY:
+            label = f"{identity} ({similarity:.2f})"
+        else:
+            label = identity
+
+        text_y = max(
+            25,
+            y1 - 10
+        )
+
+        cv2.putText(
+            frame,
+            label,
+            (x1, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2
+        )
+
+
+# =========================================================
+# 12. MAIN
+# =========================================================
+
 def main():
     global latest_detections
-    
-    ai_thread = threading.Thread(target=ai_worker, daemon=True)
+
+    motion_detector = MotionDetector()
+
+    ai_thread = threading.Thread(
+        target=ai_worker,
+        daemon=True
+    )
+
     ai_thread.start()
 
-    cap = cv2.VideoCapture("http://192.168.100.12:8080/video")
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    print("[INFO] Opening camera...")
+
+    cap = cv2.VideoCapture(
+        CAMERA_SOURCE
+    )
+
+    cap.set(
+        cv2.CAP_PROP_BUFFERSIZE,
+        1
+    )
 
     if not cap.isOpened():
-        print("❌ Error: Could not open camera.")
+        print("[ERROR] Could not open camera.")
+        stop_event.set()
         return
 
-    print("🎥 Live camera active. Real-time rendering on Main Thread...")
+    print("[INFO] Camera active.")
+    print("[INFO] Press Q to exit.")
 
-    while cap.isOpened():
+    fps_counter = 0
+    fps_start = time.time()
+    display_fps = 0.0
+
+    motion_active = False
+    previous_motion_state = False
+
+    while not stop_event.is_set():
+
         ret, frame = cap.read()
+
         if not ret:
+            print("[ERROR] Camera frame failed.")
             break
 
-        frame = cv2.resize(frame, (1280, 720))
+        frame = cv2.resize(
+            frame,
+            (FRAME_WIDTH, FRAME_HEIGHT)
+        )
 
-        # 1. Send a copy to the AI Worker in the background
-        if not input_queue.full():
-            try:
-                input_queue.get_nowait() 
-            except queue.Empty:
-                pass
-            input_queue.put(frame.copy())
+        # ==========================================
+        # MOTION GATE
+        # ==========================================
 
-        # 2. 🔥 NEW: Draw the latest known coordinates directly on the live feed
-        for bbox, identity, max_sim in latest_detections:
-            color = (0, 255, 0) if identity != "Intruder" else (0, 0, 255)
-            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
-            cv2.putText(frame, f"{identity} ({max_sim:.2f})", (bbox[0], bbox[1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        if ENABLE_MOTION_GATE:
+            motion_active = motion_detector.detect(
+                frame
+            )
+        else:
+            motion_active = True
 
-        # 3. Show the frame instantly
-        cv2.imshow("CCTV AI Stream (Ultra Low Latency)", frame)
+        if motion_active:
+            send_latest_frame(
+                frame
+            )
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # When the motion hold period ends, immediately remove
+        # old face boxes instead of waiting for another AI result.
+        if previous_motion_state and not motion_active:
+            with detections_lock:
+                latest_detections = []
+
+        previous_motion_state = motion_active
+
+        # ==========================================
+        # GET + DRAW LATEST AI RESULT
+        # ==========================================
+
+        with detections_lock:
+            detections_copy = list(
+                latest_detections
+            )
+
+        draw_detections(
+            frame,
+            detections_copy
+        )
+
+        # ==========================================
+        # STATUS
+        # ==========================================
+
+        status = (
+            "AI ACTIVE"
+            if motion_active
+            else "STANDBY"
+        )
+
+        status_color = (
+            (0, 255, 0)
+            if motion_active
+            else (0, 255, 255)
+        )
+
+        cv2.putText(
+            frame,
+            status,
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            status_color,
+            2
+        )
+
+        # ==========================================
+        # DISPLAY FPS
+        # ==========================================
+
+        fps_counter += 1
+
+        elapsed = time.time() - fps_start
+
+        if elapsed >= 1.0:
+            display_fps = fps_counter / elapsed
+            fps_counter = 0
+            fps_start = time.time()
+
+        cv2.putText(
+            frame,
+            f"FPS: {display_fps:.1f}",
+            (20, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2
+        )
+
+        # ==========================================
+        # DISPLAY
+        # ==========================================
+
+        cv2.imshow(
+            "CCTV AI Surveillance",
+            frame
+        )
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
             break
+
+    print("[INFO] Shutting down...")
+
+    stop_event.set()
 
     cap.release()
     cv2.destroyAllWindows()
+
+    ai_thread.join(
+        timeout=2
+    )
+
+    print("[INFO] System stopped.")
+
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
 
 if __name__ == "__main__":
     main()
