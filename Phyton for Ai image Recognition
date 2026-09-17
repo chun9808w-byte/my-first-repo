@@ -5,7 +5,7 @@ import sys
 cuda_bin = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin\x64"
 cudnn_bin = r"C:\Program Files\NVIDIA\CUDNN\v9.26\bin\13.4\x64"
 
-if os.path.exists(cuda_bin):
+if os.path.exists(cuda_bin): 
     os.add_dll_directory(cuda_bin)
 if os.path.exists(cudnn_bin):
     os.add_dll_directory(cudnn_bin)
